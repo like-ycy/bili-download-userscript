@@ -1,24 +1,27 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.2.1
-// @description  拖动下载图标，展开当前分 P 的可用画质和大小，选择后无损下载带声音的 MP4。
+// @version      0.3.0
+// @description  拖动下载图标，选择视频画质下载带声音的 MP4，或下载动态中的原图与图集 ZIP。
 // @author       like-ycy
 // @license      MIT
 // @homepageURL  https://github.com/like-ycy/bili-download-userscript
 // @supportURL   https://github.com/like-ycy/bili-download-userscript/issues
 // @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/*
+// @match        https://t.bilibili.com/*
 // @run-at       document-idle
 // @noframes
 // @require      https://cdn.jsdelivr.net/npm/blueimp-md5@2.19.0/js/md5.min.js
 // @resource     BiliMux https://cdn.jsdelivr.net/npm/mediabunny@1.61.4/dist/bundles/mediabunny.min.cjs
+// @resource     BiliZip https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getResourceText
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      bilivideo.com
 // @connect      bilivideo.cn
+// @connect      hdslb.com
 // ==/UserScript==
 
 (() => {
@@ -26,7 +29,7 @@
 
   const HOST_ID = 'bili-1080p-downloader';
   if (document.getElementById(HOST_ID)) return;
-  const CDN_DOMAINS = ['bilivideo.com', 'bilivideo.cn'];
+  const CDN_DOMAINS = { video: ['bilivideo.com', 'bilivideo.cn'], image: ['hdslb.com'] };
   const MAX_BYTES = 512 * 1024 * 1024;
   const QUALITY_NAMES = { 6: '240P', 16: '360P', 32: '480P', 64: '720P', 74: '720P60', 80: '1080P' };
   const CODECS = [{ id: 7, prefix: 'avc1.', name: 'H.264', mux: 'avc' },
@@ -40,13 +43,17 @@
   let inspection = null;
   let routeKey = '';
 
-  function currentVideo() {
+  function currentRoute() {
     const url = new URL(location.href);
+    const album = url.hostname === 't.bilibili.com' ? url.pathname.match(/^\/(\d+)\/?$/)
+      : url.hostname === 'www.bilibili.com' ? url.pathname.match(/^\/opus\/(\d+)\/?$/) : null;
+    if (album) return { kind: 'album', id: album[1], key: `album:${album[1]}` };
+    if (url.hostname !== 'www.bilibili.com') return null;
     const match = url.pathname.match(/^\/video\/(BV[\da-zA-Z]+|av\d+)(?:\/|$)/);
     if (!match) return null;
     const page = Number(url.searchParams.get('p') || 1);
     if (!Number.isSafeInteger(page) || page < 1) return null;
-    return { id: match[1], page, key: `${match[1]}:${page}` };
+    return { kind: 'video', id: match[1], page, key: `video:${match[1]}:${page}` };
   }
 
   function abortError() {
@@ -65,7 +72,11 @@
 
   function filename(info) {
     const suffix = ` - ${info.bvid} - P${info.page} - ${qualityName(info.qn)}.mp4`;
-    const clean = String(info.title).normalize('NFC')
+    return safeFilename(info.title, suffix, '哔哩哔哩视频');
+  }
+
+  function safeFilename(value, suffix, fallback) {
+    const clean = String(value).normalize('NFC')
       .replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '_')
       .replace(/\s+/g, ' ').trim();
     let title = '';
@@ -75,9 +86,14 @@
       if ((next + suffix).length > 150 || encoder.encode(next + suffix).length > 220) break;
       title = next;
     }
-    title = title.replace(/[. ]+$/g, '') || '哔哩哔哩视频';
+    title = title.replace(/[. ]+$/g, '') || fallback;
     if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(title)) title = `_${title}`;
     return title + suffix;
+  }
+
+  function albumFilename(info, row) {
+    const suffix = row ? ` - ${info.id} - ${String(row.index).padStart(2, '0')}.${row.extension}` : ` - ${info.id}.zip`;
+    return safeFilename(info.title, suffix, '哔哩哔哩图集');
   }
 
   async function api(path, params, signal) {
@@ -132,6 +148,29 @@
     }
     const title = view.pages.length > 1 ? `${view.title} - ${part.part}` : view.title;
     return { bvid: view.bvid, cid: part.cid, page: route.page, title, duration: part.duration };
+  }
+
+  async function albumInfo(route, signal) {
+    const data = await api('/x/polymer/web-dynamic/v1/detail', { id: route.id, features: 'itemOpusStyle' }, signal);
+    const item = data?.item;
+    if (item?.id_str !== route.id) throw new Error('动态信息与当前页面不一致，请刷新列表重试。');
+    if (item.type !== 'DYNAMIC_TYPE_DRAW') throw new Error('当前动态不是图集，暂不支持下载。');
+    const dynamic = item.modules?.module_dynamic;
+    const major = dynamic?.major;
+    const pictures = major?.type === 'MAJOR_TYPE_OPUS' ? major.opus?.pics
+      : major?.type === 'MAJOR_TYPE_DRAW' ? major.draw?.items : null;
+    if (!Array.isArray(pictures) || !pictures.length) throw new Error('没有取得图集原图，请刷新列表重试。');
+    const rows = pictures.map((picture, index) => {
+      const url = originalImageUrl(major.type === 'MAJOR_TYPE_OPUS' ? picture.url : picture.src);
+      if (!url) throw new Error(`第 ${index + 1} 张图片的原图地址无效，已停止读取图集。`);
+      const size = Number(picture.size) * 1024;
+      return { index: index + 1, url, extension: new URL(url).pathname.split('.').pop().toLowerCase(),
+        width: Number(picture.width), height: Number(picture.height),
+        size: Number.isFinite(size) && size > 0 ? Math.round(size) : null };
+    });
+    const author = item.modules?.module_author?.name || '哔哩哔哩图集';
+    const description = major.opus?.title || major.opus?.summary?.text || dynamic.desc?.text || '';
+    return { info: { id: route.id, title: description ? `${author} - ${description}` : author }, rows };
   }
 
   async function playInfo(info, qn, signal, nav) {
@@ -194,18 +233,28 @@
     return { info, rows: [...rows.values()].sort((a, b) => b.qn - a.qn), incomplete };
   }
 
-  function mediaUrl(value) {
+  function mediaUrl(value, kind = 'video') {
     try {
       const url = new URL(value);
       if (url.protocol === 'http:') url.protocol = 'https:';
       if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) return '';
-      return CDN_DOMAINS.some(domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`)) ? url.href : '';
+      return CDN_DOMAINS[kind]?.some(domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`)) ? url.href : '';
     } catch { return ''; }
+  }
+
+  function originalImageUrl(value) {
+    const allowed = mediaUrl(value, 'image');
+    if (!allowed) return '';
+    const url = new URL(allowed);
+    url.pathname = url.pathname.split('@')[0];
+    if (!/^\/bfs\/(new_dyn|album)\/[\da-z_-]+\.(jpe?g|png|gif|webp|avif|bmp)$/i.test(url.pathname)) return '';
+    url.search = ''; url.hash = '';
+    return url.href;
   }
 
   function mediaUrls(stream) {
     return [...new Set([stream.baseUrl, stream.base_url, stream.backupUrl, stream.backup_url]
-      .flat().map(mediaUrl).filter(Boolean))];
+      .flat().map(value => mediaUrl(value)).filter(Boolean))];
   }
 
   function header(response, name) {
@@ -220,10 +269,12 @@
     return Number.isSafeInteger(size) && size > 0 ? size : null;
   }
 
-  function requestMedia(url, { signal, method = 'GET', range = false, onProgress } = {}) {
+  function requestMedia(url, { signal, method = 'GET', range = false, onProgress, kind = 'video' } = {}) {
     return new Promise((resolve, reject) => {
       checkAbort(signal);
-      if (!mediaUrl(url)) throw new Error('媒体地址不属于允许的 B 站域名。');
+      const validate = kind === 'image' ? originalImageUrl : value => mediaUrl(value, kind);
+      url = validate(url);
+      if (!url) throw new Error('媒体地址不属于允许的 B 站域名或路径。');
       let request;
       let settled = false;
       const finish = (error, value) => {
@@ -237,8 +288,10 @@
         request?.abort();
       };
       const receive = response => {
-        if (![200, ...(range ? [206] : [])].includes(response.status) || !mediaUrl(response.finalUrl || url)) {
+        if (![200, ...(range ? [206] : [])].includes(response.status) || !validate(response.finalUrl || url)) {
           finish(new Error(`媒体服务器返回异常（HTTP ${response.status}）。`));
+        } else if (kind === 'image' && !/^image\/(jpeg|png|gif|webp|avif|bmp|x-ms-bmp)(?:;|$)/i.test(header(response, 'content-type'))) {
+          finish(new Error('图片服务器没有返回可用的原图。'));
         } else if (/text\/|json/i.test(header(response, 'content-type'))) {
           finish(new Error('媒体服务器返回了错误页面。'));
         } else finish(null, response);
@@ -274,8 +327,8 @@
     });
   }
 
-  async function requestBlob(url, signal, onProgress) {
-    const response = await requestMedia(url, { signal, onProgress });
+  async function requestBlob(url, signal, onProgress, kind = 'video') {
+    const response = await requestMedia(url, { signal, onProgress, kind });
     checkAbort(signal);
     const blob = response.response;
     const length = responseSize(response);
@@ -410,7 +463,7 @@
   }
 
   function save(buffer, name) {
-    const blob = new Blob([buffer], { type: 'video/mp4' });
+    const blob = buffer instanceof Blob ? buffer : new Blob([buffer], { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -422,14 +475,20 @@
   }
 
   async function beginInspection() {
-    const route = currentVideo();
+    const route = currentRoute();
     if (!route) return;
     inspection?.controller.abort();
-    const state = { key: route.key, controller: new AbortController(), info: null, rows: [], busy: true, error: '' };
+    const state = { key: route.key, kind: route.kind, controller: new AbortController(), info: null, rows: [], busy: true, error: '' };
     inspection = state;
     renderInspection();
     const signal = state.controller.signal;
     try {
+      if (route.kind === 'album') {
+        const result = await albumInfo(route, signal);
+        checkAbort(signal);
+        if (inspection === state) Object.assign(state, result);
+        return;
+      }
       const result = await resolveQualities(route, signal, info => {
         if (inspection !== state || signal.aborted) return;
         state.info = info;
@@ -461,7 +520,7 @@
       };
       await Promise.all([run(), run()]);
     } catch (error) {
-      if (!signal.aborted) state.error = error.message || '读取画质失败，请重试。';
+      if (!signal.aborted) state.error = error.message || '读取列表失败，请重试。';
     } finally {
       if (inspection === state && !signal.aborted) {
         state.busy = false;
@@ -472,34 +531,59 @@
 
   function renderInspection() {
     const state = inspection;
-    ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前视频…' : '选择当前视频的画质');
-    ui.details.textContent = state?.info ? `P${state.info.page} · 普通账号可用画质` : '使用当前网页登录状态';
-    ui.inspectStatus.textContent = state?.error || (state?.busy
-      ? state.rows.length ? '正在读取各画质大小…' : '正在获取可用画质…'
-      : state?.rows.length ? `共 ${state.rows.length} 个画质可选${state.incomplete ? '，部分档位解析失败，可刷新重试' : ''}。`
-      : '点击刷新列表，读取当前视频的可用画质。');
+    const album = (state?.kind || currentRoute()?.kind) === 'album';
+    ui.heading.textContent = album ? '下载当前图集' : '下载当前视频';
+    ui.panel.setAttribute('aria-label', album ? '哔哩哔哩图集下载' : '哔哩哔哩视频下载');
+    ui.launch.title = album ? '点击下载图集原图，拖动调整位置' : '点击选择下载画质，拖动调整位置';
+    ui.launch.setAttribute('aria-label', album ? '展开或收起图集下载面板' : '展开或收起视频下载面板');
+    ui.column.textContent = album ? '图片' : '画质';
+    ui.sizeColumn.textContent = album ? '原图大小（约）' : '大小（含音频）';
+    ui.hint.textContent = album ? '按发布顺序下载原图，保留原始格式。打包为一个 ZIP，单次上限 512 MB。'
+      : '大小为音视频合计，合并后可能略有差异。单次上限 512 MB。';
+    ui.downloadAll.hidden = !album;
+    ui.downloadAll.disabled = Boolean(activeTask || state?.busy || !state?.rows.length
+      || state.rows.reduce((sum, row) => sum + (row.size || 0), 0) > MAX_BYTES);
+    if (album) {
+      ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前图集…' : '下载动态中的原图');
+      ui.details.textContent = state?.info ? `动态 ${state.info.id} · ${state.rows.length} 张原图` : '使用当前网页可访问的动态';
+      ui.inspectStatus.textContent = state?.error || (state?.busy ? '正在获取图集原图…'
+        : state?.rows.length ? `共 ${state.rows.length} 张图片，可单张下载或全部打包。` : '点击刷新列表，读取当前图集。');
+    } else {
+      ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前视频…' : '选择当前视频的画质');
+      ui.details.textContent = state?.info ? `P${state.info.page} · 普通账号可用画质` : '使用当前网页登录状态';
+      ui.inspectStatus.textContent = state?.error || (state?.busy
+        ? state.rows.length ? '正在读取各画质大小…' : '正在获取可用画质…'
+        : state?.rows.length ? `共 ${state.rows.length} 个画质可选${state.incomplete ? '，部分档位解析失败，可刷新重试' : ''}。`
+        : '点击刷新列表，读取当前视频的可用画质。');
+    }
     ui.refresh.disabled = Boolean(state?.busy || activeTask);
     ui.rows.replaceChildren();
     ui.table.hidden = !state?.rows.length;
     for (const row of state?.rows || []) {
       const tr = document.createElement('tr');
-      tr.dataset.quality = String(row.qn);
+      if (album) tr.dataset.image = String(row.index); else tr.dataset.quality = String(row.qn);
       const quality = document.createElement('td');
-      const name = document.createElement('strong'); name.textContent = qualityName(row.qn);
+      const name = document.createElement('strong'); name.textContent = album ? `第 ${row.index} 张` : qualityName(row.qn);
       const detail = document.createElement('small');
-      detail.textContent = `${row.video.width} × ${row.video.height} · ${row.codec.name}`;
+      detail.textContent = album ? `${row.width > 0 && row.height > 0 ? `${row.width} × ${row.height}` : '尺寸未知'} · ${row.extension.toUpperCase()}`
+        : `${row.video.width} × ${row.video.height} · ${row.codec.name}`;
       quality.append(name, detail);
+      if (album) {
+        const link = document.createElement('a');
+        link.href = row.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = '查看原图';
+        quality.append(link);
+      }
       const size = document.createElement('td');
       size.textContent = row.probing ? '读取中…' : row.size ? bytes(row.size) : '大小未知';
-      size.title = row.sizeError || '视频与音频的合计大小，合并后的 MP4 可能略有差异';
+      size.title = album ? '接口提供的原图大小估计，实际以下载文件为准' : row.sizeError || '视频与音频的合计大小，合并后的 MP4 可能略有差异';
       const action = document.createElement('td');
       const button = document.createElement('button'); button.type = 'button';
       const oversized = row.size > MAX_BYTES;
       button.textContent = oversized ? '超过上限' : '下载';
       button.className = 'primary';
       button.disabled = Boolean(activeTask || row.probing || oversized);
-      button.setAttribute('aria-label', `下载 ${qualityName(row.qn)}`);
-      button.addEventListener('click', () => startDownload(state, row));
+      button.setAttribute('aria-label', album ? `下载第 ${row.index} 张原图` : `下载 ${qualityName(row.qn)}`);
+      button.addEventListener('click', () => album ? startAlbumDownload(state, row) : startDownload(state, row));
       action.append(button); tr.append(quality, size, action); ui.rows.append(tr);
     }
     placePanel();
@@ -507,7 +591,7 @@
 
   async function startDownload(state, row) {
     if (activeTask || state !== inspection || row.probing || row.size > MAX_BYTES) return;
-    if (currentVideo()?.key !== state.key) { syncRoute(); return; }
+    if (currentRoute()?.key !== state.key) { syncRoute(); return; }
     const controller = new AbortController();
     // 固定点击时的视频、分 P 和画质；页面切换不会改写正在进行的任务。
     const info = { ...state.info, qn: row.qn, codec: row.codec };
@@ -563,6 +647,114 @@
       renderInspection();
       syncRoute();
     }
+  }
+
+  async function startAlbumDownload(state, selectedRow = null) {
+    if (activeTask || state !== inspection || state?.kind !== 'album' || state.busy || !state.rows.length) return;
+    if (currentRoute()?.key !== state.key) { syncRoute(); return; }
+    const rows = selectedRow ? [selectedRow] : [...state.rows];
+    const info = { ...state.info };
+    const controller = new AbortController();
+    const signal = controller.signal;
+    activeTask = controller;
+    ui.task.hidden = false;
+    ui.taskTitle.textContent = selectedRow ? albumFilename(info, selectedRow) : albumFilename(info);
+    ui.cancel.hidden = false;
+    renderInspection();
+    let completedBytes = 0;
+    try {
+      const files = [];
+      for (const [index, row] of rows.entries()) {
+        checkAbort(signal);
+        const progress = (loaded, total) => {
+          if (signal.aborted) return;
+          if (completedBytes + Math.max(loaded, total) > MAX_BYTES) {
+            controller.abort(new Error('图片合计超过 512 MB 上限，请分张下载或使用桌面下载器。'));
+            return;
+          }
+          status(`正在下载第 ${row.index} 张 · ${index + 1} / ${rows.length} · ${bytes(completedBytes + loaded)}`,
+            (index + (total ? loaded / total : 0)) / rows.length * (selectedRow ? 1 : 0.9));
+        };
+        progress(0, row.size || 0);
+        const blob = await requestBlob(row.url, signal, progress, 'image');
+        checkAbort(signal);
+        completedBytes += blob.size;
+        if (selectedRow) save(blob, albumFilename(info, row));
+        else files.push({ name: albumFilename(info, row), blob });
+      }
+      if (!selectedRow) {
+        status('正在打包图集…', 0.9);
+        const result = await packAlbum(files, signal);
+        checkAbort(signal);
+        save(new Blob([result.buffer], { type: 'application/zip' }), albumFilename(info));
+        console.info('[Bili1080P] 已生成图集 ZIP', { id: info.id, images: rows.length,
+          size: result.buffer.byteLength, packSeconds: result.seconds });
+      }
+      status(`已交给浏览器保存 · ${rows.length} 张原图 · ${bytes(completedBytes)}`, 1);
+    } catch (error) {
+      controller.abort(error);
+      status(error.name === 'AbortError' ? '已取消下载。' : error.message || '图集下载失败，请重试。');
+    } finally {
+      activeTask = null;
+      ui.cancel.hidden = true;
+      ui.progress.hidden = !ui.progress.hasAttribute('value');
+      renderInspection();
+      syncRoute();
+    }
+  }
+
+  function zipWorkerMain() {
+    self.onmessage = async ({ data }) => {
+      const started = performance.now();
+      try {
+        const zip = new JSZip();
+        for (const file of data.files) zip.file(file.name, new Uint8Array(await file.blob.arrayBuffer()));
+        let lastUpdate = 0;
+        const buffer = await zip.generateAsync({ type: 'arraybuffer', compression: 'STORE', streamFiles: true }, metadata => {
+          if (performance.now() - lastUpdate > 100 || metadata.percent === 100) {
+            self.postMessage({ type: 'progress', ratio: metadata.percent / 100 });
+            lastUpdate = performance.now();
+          }
+        });
+        self.postMessage({ type: 'done', buffer, seconds: (performance.now() - started) / 1000 }, [buffer]);
+      } catch (error) {
+        self.postMessage({ type: 'error', message: error.message || '图集打包失败。' });
+      }
+    };
+  }
+
+  function packAlbum(files, signal) {
+    return new Promise((resolve, reject) => {
+      checkAbort(signal);
+      const library = GM_getResourceText('BiliZip');
+      if (!library) throw new Error('图集打包组件未加载，请重新安装脚本后重试。');
+      const url = URL.createObjectURL(new Blob([library, '\n;(', zipWorkerMain.toString(), ')();'], { type: 'text/javascript' }));
+      let worker;
+      let settled = false;
+      const finish = (error, result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal.removeEventListener('abort', cancel);
+        worker?.terminate();
+        URL.revokeObjectURL(url);
+        if (error) reject(error); else resolve(result);
+      };
+      const cancel = () => finish(signal.reason || abortError());
+      const timeout = setTimeout(() => finish(new Error('图集打包超时，请分张下载或重试。')), 120000);
+      signal.addEventListener('abort', cancel, { once: true });
+      try {
+        worker = new Worker(url);
+        worker.onerror = () => finish(new Error('无法启动图集打包组件，请重新安装脚本后重试。'));
+        worker.onmessage = ({ data }) => {
+          if (settled) return;
+          if (data.type === 'progress') status('正在打包图集…', 0.9 + data.ratio * 0.1);
+          if (data.type === 'error') finish(new Error(data.message));
+          if (data.type === 'done') finish(null, data);
+        };
+        worker.postMessage({ files });
+      } catch (error) { finish(error); }
+    });
   }
 
   function status(message, ratio = null) {
@@ -674,16 +866,18 @@
         header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}header strong{font-size:16px}#close{padding:2px 8px;background:transparent;font-size:22px;color:#758796}
         #title{font-weight:600;line-height:1.6;overflow-wrap:anywhere;max-height:76px;overflow:auto}
         #details,.hint,small{color:#688093;font-size:12px;line-height:1.6}#details{margin-top:5px}small{display:block}p{margin:10px 0}
+        a{color:#008ac5;font-size:12px}#downloadAll{margin-right:8px}
         table{width:100%;border-collapse:collapse;table-layout:fixed;margin:12px 0}th,td{text-align:left;border-bottom:1px solid #e6eef4;padding:10px 4px;font-size:13px;overflow-wrap:anywhere}th{color:#688093;font-weight:500}th:first-child{width:46%}th:nth-child(2){width:29%}td:last-child{text-align:right}td button{white-space:nowrap;font-size:12px;padding:7px 10px}
         #task{border-top:1px solid #e6eef4;margin-top:14px;padding-top:12px}#taskTitle{font-size:12px;color:#688093;overflow-wrap:anywhere;max-height:60px;overflow:auto}#status{line-height:1.7;margin:10px 0;overflow-wrap:anywhere}
         progress{width:100%;height:7px;accent-color:#008ac5;display:block;margin:12px 0}footer{display:flex;gap:8px;margin-top:10px}
       </style>
       <section id="panel" hidden aria-label="哔哩哔哩视频下载">
-        <header><strong>下载当前视频</strong><button id="close" type="button" aria-label="收起下载面板">×</button></header>
+        <header><strong id="heading">下载当前视频</strong><button id="close" type="button" aria-label="收起下载面板">×</button></header>
         <div id="title">选择当前视频的画质</div><div id="details">使用当前网页登录状态</div>
         <p id="inspectStatus" role="status" class="hint"></p>
-        <table id="table" hidden><thead><tr><th scope="col">画质</th><th scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
-        <p class="hint">大小为音视频合计，合并后可能略有差异。单次上限 512 MB。</p>
+        <table id="table" hidden><thead><tr><th id="column" scope="col">画质</th><th id="sizeColumn" scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <p id="hint" class="hint">大小为音视频合计，合并后可能略有差异。单次上限 512 MB。</p>
+        <button id="downloadAll" class="primary" type="button" hidden>下载全部原图（ZIP）</button>
         <button id="refresh" type="button">刷新列表</button>
         <div id="task" hidden><div id="taskTitle"></div><div id="status" role="status" aria-live="polite"></div>
           <progress id="progress" max="1" hidden></progress><footer><button id="cancel" type="button" hidden>取消下载</button></footer>
@@ -695,15 +889,16 @@
     document.documentElement.append(host);
     const elements = { host };
     for (const id of ['panel', 'title', 'details', 'inspectStatus', 'table', 'rows', 'refresh', 'task', 'taskTitle',
-      'status', 'progress', 'cancel', 'launch', 'close']) elements[id] = shadow.getElementById(id);
+      'status', 'progress', 'cancel', 'launch', 'close', 'heading', 'column', 'sizeColumn', 'hint', 'downloadAll']) elements[id] = shadow.getElementById(id);
     elements.refresh.addEventListener('click', beginInspection);
+    elements.downloadAll.addEventListener('click', () => startAlbumDownload(inspection));
     elements.cancel.addEventListener('click', () => activeTask?.abort(abortError()));
     elements.close.addEventListener('click', () => setPanelOpen(false));
     return elements;
   }
 
   function syncRoute() {
-    const route = currentVideo();
+    const route = currentRoute();
     ui.host.style.display = route || activeTask ? 'block' : 'none';
     const key = route?.key || '';
     if (key === routeKey) return;
@@ -721,7 +916,7 @@
     if (dragging.ignoreClick(event)) return;
     syncRoute();
     setPanelOpen(ui.panel.hidden);
-    if (!ui.panel.hidden && !inspection && currentVideo()) void beginInspection();
+    if (!ui.panel.hidden && !inspection && currentRoute()) void beginInspection();
   });
   new ResizeObserver(placePanel).observe(ui.panel);
   dragging.update();
