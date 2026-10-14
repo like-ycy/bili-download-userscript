@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.1.0
-// @description  使用网页登录态下载当前分 P 的普通 1080P，快速无损合并为带声音的 MP4。
+// @version      0.2.0
+// @description  拖动下载图标，展开当前分 P 的可用画质和大小，选择后无损下载带声音的 MP4。
 // @license      MIT
 // @match        https://www.bilibili.com/*
 // @run-at       document-idle
@@ -11,6 +11,8 @@
 // @resource     BiliMux https://cdn.jsdelivr.net/npm/mediabunny@1.61.4/dist/bundles/mediabunny.min.cjs
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getResourceText
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      bilivideo.com
 // @connect      bilivideo.cn
 // ==/UserScript==
@@ -22,11 +24,16 @@
   if (document.getElementById(HOST_ID)) return;
   const CDN_DOMAINS = ['bilivideo.com', 'bilivideo.cn'];
   const MAX_BYTES = 512 * 1024 * 1024;
+  const QUALITY_NAMES = { 6: '240P', 16: '360P', 32: '480P', 64: '720P', 74: '720P60', 80: '1080P' };
+  const CODECS = [{ id: 7, prefix: 'avc1.', name: 'H.264', mux: 'avc' },
+    { id: 12, prefix: 'hvc1.', name: 'H.265', mux: 'hevc' },
+    { id: 13, prefix: 'av01.', name: 'AV1', mux: 'av1' }];
   const MIXIN = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7,
     16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59,
     6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
   let activeTask = null;
+  let inspection = null;
   let routeKey = '';
 
   function currentVideo() {
@@ -50,8 +57,10 @@
     return `${(value / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  function qualityName(qn) { return QUALITY_NAMES[qn] || `画质${Number(qn)}`; }
+
   function filename(info) {
-    const suffix = ` - ${info.bvid} - P${info.page} - 1080P.mp4`;
+    const suffix = ` - ${info.bvid} - P${info.page} - ${qualityName(info.qn)}.mp4`;
     const clean = String(info.title).normalize('NFC')
       .replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '_')
       .replace(/\s+/g, ' ').trim();
@@ -104,37 +113,81 @@
     return `${query}&w_rid=${md5(query + mixin)}`;
   }
 
-  async function resolveMedia(route, signal) {
-    let nav = await api('/x/web-interface/nav', {}, signal);
+  async function loginInfo(signal) {
+    const nav = await api('/x/web-interface/nav', {}, signal);
     if (!nav.isLogin) throw new Error('请先在当前浏览器登录哔哩哔哩，然后重试。');
+    return nav;
+  }
+
+  async function videoInfo(route, signal) {
     const ids = route.id.startsWith('BV') ? { bvid: route.id } : { aid: route.id.slice(2) };
     const view = await api('/x/web-interface/view', ids, signal);
     const part = view?.pages?.find(entry => entry.page === route.page);
     if (!part || !Number.isSafeInteger(part.cid) || !/^BV[\da-zA-Z]+$/.test(view.bvid)) {
       throw new Error('无法识别当前分 P，请等视频加载后重试。');
     }
-    const params = { bvid: view.bvid, cid: part.cid, qn: 80, fnver: 0, fnval: 4048, fourk: 0 };
-    let play;
+    const title = view.pages.length > 1 ? `${view.title} - ${part.part}` : view.title;
+    return { bvid: view.bvid, cid: part.cid, page: route.page, title, duration: part.duration };
+  }
+
+  async function playInfo(info, qn, signal, nav) {
+    nav ||= await loginInfo(signal);
+    const params = { bvid: info.bvid, cid: info.cid, qn, fnver: 0, fnval: 4048, fourk: 0 };
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        play = await api('/x/player/wbi/playurl', wbiQuery(params, nav), signal);
-        break;
+        return await api('/x/player/wbi/playurl', wbiQuery(params, nav), signal);
       } catch (error) {
         if (attempt || error.apiCode !== -403) throw error;
-        nav = await api('/x/web-interface/nav', {}, signal);
-        if (!nav.isLogin) throw new Error('登录已失效，请重新登录后重试。');
+        nav = await loginInfo(signal);
       }
     }
-    const videos = (play?.dash?.video || []).filter(v => Number(v.id) === 80);
-    if (!videos.length) throw new Error('当前账号未取得普通 1080P 视频流。请确认网页可播放 1080P；本脚本不会自动降低画质。');
-    const video = videos.filter(v => Number(v.codecid) === 7 && /^avc1\./i.test(v.codecs))
-      .sort((a, b) => b.bandwidth - a.bandwidth)[0];
-    if (!video) throw new Error('这个视频没有可用的 1080P H.264 视频轨，首版暂不支持其编码。');
-    const audio = (play.dash.audio || []).filter(a => /^mp4a\.40\./i.test(a.codecs))
+  }
+
+  function ordinaryQuality(qn, play) {
+    const format = play?.support_formats?.find(entry => Number(entry.quality) === qn);
+    return Number.isInteger(qn) && qn > 0 && qn <= 80 && !format?.need_vip;
+  }
+
+  function audioStream(play) {
+    const audio = (play?.dash?.audio || []).filter(a => /^mp4a\.40\./i.test(a.codecs) && mediaUrls(a).length)
       .sort((a, b) => b.bandwidth - a.bandwidth)[0];
     if (!audio) throw new Error('没有取得可用的 AAC 音频轨，无法生成带声音的 MP4。');
-    const title = view.pages.length > 1 ? `${view.title} - ${part.part}` : view.title;
-    return { bvid: view.bvid, cid: part.cid, page: route.page, title, video, audio, duration: part.duration };
+    return audio;
+  }
+
+  function qualityRows(play) {
+    const rows = new Map();
+    for (const codec of CODECS) {
+      const streams = (play?.dash?.video || []).filter(v => Number(v.codecid) === codec.id
+        && String(v.codecs).startsWith(codec.prefix) && ordinaryQuality(Number(v.id), play) && mediaUrls(v).length)
+        .sort((a, b) => b.bandwidth - a.bandwidth);
+      for (const video of streams) {
+        const qn = Number(video.id);
+        if (!rows.has(qn)) rows.set(qn, { qn, video, codec, size: null, probing: true });
+      }
+    }
+    return [...rows.values()].sort((a, b) => b.qn - a.qn);
+  }
+
+  async function resolveQualities(route, signal, onInfo) {
+    const nav = await loginInfo(signal);
+    const info = await videoInfo(route, signal);
+    onInfo(info);
+    const play = await playInfo(info, 80, signal, nav);
+    const audio = audioStream(play);
+    const rows = new Map(qualityRows(play).map(row => [row.qn, { ...row, audio }]));
+    // 部分稿件一次响应不含全部已声明档位；补取后仍只接受实际返回的流。
+    const declared = [...new Set((play.support_formats || []).map(entry => Number(entry.quality)))];
+    let incomplete = false;
+    for (const qn of declared.filter(qn => qn !== 80 && ordinaryQuality(qn, play) && !rows.has(qn))) {
+      try {
+        const extra = await playInfo(info, qn, signal, nav);
+        const extraAudio = audioStream(extra);
+        for (const row of qualityRows(extra)) if (!rows.has(row.qn)) rows.set(row.qn, { ...row, audio: extraAudio });
+      } catch { checkAbort(signal); incomplete = true; }
+    }
+    if (!rows.size) throw new Error('当前视频没有取得普通账号可下载的画质，请确认登录状态后刷新列表。');
+    return { info, rows: [...rows.values()].sort((a, b) => b.qn - a.qn), incomplete };
   }
 
   function mediaUrl(value) {
@@ -151,9 +204,22 @@
       .flat().map(mediaUrl).filter(Boolean))];
   }
 
-  function requestBlob(url, signal, onProgress) {
+  function header(response, name) {
+    return String(response.responseHeaders || '').split(/\r?\n/)
+      .find(line => line.slice(0, line.indexOf(':')).toLowerCase() === name.toLowerCase())
+      ?.slice(name.length + 1).trim() || '';
+  }
+
+  function responseSize(response) {
+    const range = header(response, 'content-range').match(/^bytes\s+0-0\/(\d+)$/i);
+    const size = Number(response.status === 206 ? range?.[1] : header(response, 'content-length'));
+    return Number.isSafeInteger(size) && size > 0 ? size : null;
+  }
+
+  function requestMedia(url, { signal, method = 'GET', range = false, onProgress } = {}) {
     return new Promise((resolve, reject) => {
       checkAbort(signal);
+      if (!mediaUrl(url)) throw new Error('媒体地址不属于允许的 B 站域名。');
       let request;
       let settled = false;
       const finish = (error, value) => {
@@ -166,28 +232,35 @@
         finish(signal.reason || abortError());
         request?.abort();
       };
+      const receive = response => {
+        if (![200, ...(range ? [206] : [])].includes(response.status) || !mediaUrl(response.finalUrl || url)) {
+          finish(new Error(`媒体服务器返回异常（HTTP ${response.status}）。`));
+        } else if (/text\/|json/i.test(header(response, 'content-type'))) {
+          finish(new Error('媒体服务器返回了错误页面。'));
+        } else finish(null, response);
+      };
       signal.addEventListener('abort', cancel, { once: true });
       try {
         request = GM_xmlhttpRequest({
-          method: 'GET', url, responseType: 'blob', anonymous: true, timeout: 180000,
-          headers: { Referer: 'https://www.bilibili.com/' },
+          method, url, responseType: 'blob', anonymous: true, timeout: range || method === 'HEAD' ? 10000 : 180000,
+          headers: { Referer: 'https://www.bilibili.com/', ...(range ? { Range: 'bytes=0-0' } : {}) },
+          onreadystatechange(response) {
+            // Range 探测取得响应头即停止正文，CDN 忽略 Range 也不读取整个视频。
+            if (range && !settled && response.readyState === 2 && response.status) {
+              receive(response);
+              request?.abort();
+            }
+          },
           onprogress(event) {
-            if (!settled) onProgress(event.loaded || 0, event.lengthComputable ? event.total : 0);
+            if (settled) return;
+            if (range && event.loaded > 65536) {
+              finish(new Error('媒体服务器未按范围响应，已停止读取。'));
+              request?.abort();
+            } else onProgress?.(event.loaded || 0, event.lengthComputable ? event.total : 0);
           },
           onload(response) {
             if (settled) return;
-            if (response.status !== 200 || !mediaUrl(response.finalUrl || url)) {
-              finish(new Error(`媒体服务器返回异常（HTTP ${response.status}）。`));
-              return;
-            }
-            const blob = response.response;
-            const length = Number((response.responseHeaders || '').match(/^content-length:\s*(\d+)/im)?.[1] || 0);
-            if (!(blob instanceof Blob) || !blob.size || (length && length !== blob.size)) {
-              finish(new Error('下载文件不完整，请重试。'));
-              return;
-            }
-            onProgress(blob.size, blob.size);
-            if (!signal.aborted) finish(null, blob);
+            receive(response);
           },
           onerror: () => finish(new Error('媒体下载失败，请检查网络或油猴的域名访问权限。')),
           ontimeout: () => finish(new Error('媒体下载超时，请重试。')),
@@ -195,6 +268,29 @@
         });
       } catch (error) { finish(error); }
     });
+  }
+
+  async function requestBlob(url, signal, onProgress) {
+    const response = await requestMedia(url, { signal, onProgress });
+    checkAbort(signal);
+    const blob = response.response;
+    const length = responseSize(response);
+    if (!(blob instanceof Blob) || !blob.size || (length && length !== blob.size)) throw new Error('下载文件不完整，请重试。');
+    onProgress(blob.size, blob.size);
+    checkAbort(signal);
+    return blob;
+  }
+
+  async function probeTrack(stream, signal) {
+    for (const url of mediaUrls(stream)) {
+      for (const options of [{ method: 'HEAD' }, { range: true }]) {
+        try {
+          const size = responseSize(await requestMedia(url, { ...options, signal }));
+          if (size) return size;
+        } catch { checkAbort(signal); }
+      }
+    }
+    throw new Error('服务器未提供可读取的文件大小');
   }
 
   async function downloadTrack(stream, signal, onProgress) {
@@ -228,8 +324,8 @@
           video.getCodec(), audio.getCodec(), video.getDecoderConfig(), audio.getDecoderConfig(), video.getRotation(),
           video.computeDuration(), audio.computeDuration(),
         ]);
-        if (videoCodec !== 'avc' || audioCodec !== 'aac' || !videoConfig || !audioConfig) {
-          throw new Error('下载文件的编码不符合 H.264 + AAC。');
+        if (videoCodec !== data.codec || audioCodec !== 'aac' || !videoConfig || !audioConfig) {
+          throw new Error('下载文件的编码与所选画质不一致。');
         }
         if (videoConfig.codedWidth !== data.width || videoConfig.codedHeight !== data.height) {
           throw new Error('下载文件的分辨率与播放接口不一致。');
@@ -241,7 +337,7 @@
         }
         const target = new BufferTarget();
         output = new Output({ format: new Mp4OutputFormat({ fastStart: false }), target });
-        const videoSource = new EncodedVideoPacketSource('avc');
+        const videoSource = new EncodedVideoPacketSource(videoCodec);
         const audioSource = new EncodedAudioPacketSource('aac');
         output.addVideoTrack(videoSource, { rotation });
         output.addAudioTrack(audioSource);
@@ -303,7 +399,8 @@
           if (data.type === 'error') finish(new Error(data.message));
           if (data.type === 'done') finish(null, data);
         };
-        worker.postMessage({ video, audio, width: info.video.width, height: info.video.height, duration: info.duration });
+        worker.postMessage({ video, audio, width: info.video.width, height: info.video.height,
+          duration: info.duration, codec: info.codec.mux });
       } catch (error) { finish(error); }
     });
   }
@@ -320,25 +417,109 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  async function startDownload() {
-    if (activeTask) { ui.panel.hidden = false; return; }
+  async function beginInspection() {
     const route = currentVideo();
     if (!route) return;
+    inspection?.controller.abort();
+    const state = { key: route.key, controller: new AbortController(), info: null, rows: [], busy: true, error: '' };
+    inspection = state;
+    renderInspection();
+    const signal = state.controller.signal;
+    try {
+      const result = await resolveQualities(route, signal, info => {
+        if (inspection !== state || signal.aborted) return;
+        state.info = info;
+        renderInspection();
+      });
+      checkAbort(signal);
+      Object.assign(state, result);
+      renderInspection();
+      // 相同音轨只探测一次；最多同时探测两行，避免集中请求 CDN。
+      const measurements = new Map();
+      const measure = stream => {
+        const key = mediaUrls(stream)[0];
+        if (!measurements.has(key)) measurements.set(key, probeTrack(stream, signal)
+          .then(size => ({ size })).catch(error => ({ error: error.message })));
+        return measurements.get(key);
+      };
+      const queue = [...state.rows];
+      const run = async () => {
+        while (queue.length) {
+          checkAbort(signal);
+          const row = queue.shift();
+          const [video, audio] = await Promise.all([measure(row.video), measure(row.audio)]);
+          checkAbort(signal);
+          row.size = video.size && audio.size ? video.size + audio.size : null;
+          row.sizeError = [video.error, audio.error].filter(Boolean).join('；');
+          row.probing = false;
+          if (inspection === state) renderInspection();
+        }
+      };
+      await Promise.all([run(), run()]);
+    } catch (error) {
+      if (!signal.aborted) state.error = error.message || '读取画质失败，请重试。';
+    } finally {
+      if (inspection === state && !signal.aborted) {
+        state.busy = false;
+        renderInspection();
+      }
+    }
+  }
+
+  function renderInspection() {
+    const state = inspection;
+    ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前视频…' : '选择当前视频的画质');
+    ui.details.textContent = state?.info ? `P${state.info.page} · 普通账号可用画质` : '使用当前网页登录状态';
+    ui.inspectStatus.textContent = state?.error || (state?.busy
+      ? state.rows.length ? '正在读取各画质大小…' : '正在获取可用画质…'
+      : state?.rows.length ? `共 ${state.rows.length} 个画质可选${state.incomplete ? '，部分档位解析失败，可刷新重试' : ''}。`
+      : '点击刷新列表，读取当前视频的可用画质。');
+    ui.refresh.disabled = Boolean(state?.busy || activeTask);
+    ui.rows.replaceChildren();
+    ui.table.hidden = !state?.rows.length;
+    for (const row of state?.rows || []) {
+      const tr = document.createElement('tr');
+      tr.dataset.quality = String(row.qn);
+      const quality = document.createElement('td');
+      const name = document.createElement('strong'); name.textContent = qualityName(row.qn);
+      const detail = document.createElement('small');
+      detail.textContent = `${row.video.width} × ${row.video.height} · ${row.codec.name}`;
+      quality.append(name, detail);
+      const size = document.createElement('td');
+      size.textContent = row.probing ? '读取中…' : row.size ? bytes(row.size) : '大小未知';
+      size.title = row.sizeError || '视频与音频的合计大小，合并后的 MP4 可能略有差异';
+      const action = document.createElement('td');
+      const button = document.createElement('button'); button.type = 'button';
+      const oversized = row.size > MAX_BYTES;
+      button.textContent = oversized ? '超过上限' : '下载';
+      button.className = 'primary';
+      button.disabled = Boolean(activeTask || row.probing || oversized);
+      button.setAttribute('aria-label', `下载 ${qualityName(row.qn)}`);
+      button.addEventListener('click', () => startDownload(state, row));
+      action.append(button); tr.append(quality, size, action); ui.rows.append(tr);
+    }
+    placePanel();
+  }
+
+  async function startDownload(state, row) {
+    if (activeTask || state !== inspection || row.probing || row.size > MAX_BYTES) return;
+    if (currentVideo()?.key !== state.key) { syncRoute(); return; }
     const controller = new AbortController();
+    // 固定点击时的视频、分 P 和画质；页面切换不会改写正在进行的任务。
+    const info = { ...state.info, qn: row.qn, codec: row.codec };
     activeTask = controller;
-    ui.panel.hidden = false;
-    ui.download.disabled = true;
-    ui.launch.textContent = '查看下载进度';
+    ui.task.hidden = false;
+    ui.taskTitle.textContent = `${qualityName(row.qn)} · ${info.title}`;
     ui.cancel.hidden = false;
-    ui.title.textContent = '正在读取当前视频…';
-    ui.details.textContent = '普通 1080P · 含声音';
-    status('正在获取播放地址…');
+    status('正在更新下载地址…');
+    renderInspection();
     const started = performance.now();
     try {
-      const info = await resolveMedia(route, controller.signal);
+      const play = await playInfo(info, row.qn, controller.signal);
+      const selected = qualityRows(play).find(candidate => candidate.qn === row.qn && candidate.codec.id === row.codec.id);
+      if (!selected) throw new Error('所选画质已不可用，请刷新画质列表后重试。');
+      Object.assign(info, { video: selected.video, audio: audioStream(play) });
       checkAbort(controller.signal);
-      ui.title.textContent = info.title;
-      ui.details.textContent = `P${info.page} · ${info.video.width} × ${info.video.height} · 1080P`;
       const loaded = [0, 0];
       const totals = [0, 0];
       const progress = index => (size, total) => {
@@ -347,7 +528,7 @@
         totals[index] = total;
         const sum = loaded[0] + loaded[1];
         if (Math.max(loaded[0], totals[0]) + Math.max(loaded[1], totals[1]) > MAX_BYTES) {
-          controller.abort(new Error('音视频合计超过首版的 512 MB 上限，请使用桌面下载器下载这个视频。'));
+          controller.abort(new Error('音视频合计超过 512 MB 上限，请使用桌面下载器下载这个视频。'));
           return;
         }
         const known = totals.every(value => value > 0);
@@ -365,19 +546,17 @@
       const name = filename(info);
       save(result.buffer, name);
       status(`已交给浏览器保存 · 合并 ${result.seconds.toFixed(2)} 秒 · 共 ${((performance.now() - started) / 1000).toFixed(1)} 秒`, 1);
-      ui.details.textContent = name;
-      console.info('[Bili1080P] 已生成 MP4', { bvid: info.bvid, cid: info.cid,
+      ui.taskTitle.textContent = name;
+      console.info('[Bili1080P] 已生成 MP4', { bvid: info.bvid, cid: info.cid, quality: info.qn,
         size: result.buffer.byteLength, muxSeconds: result.seconds, videoPackets: result.counts[0], audioPackets: result.counts[1] });
     } catch (error) {
-      // 任一下载失败时同时中止另一条轨道，避免后台残留请求。
       controller.abort(error);
       status(error.name === 'AbortError' ? '已取消下载。' : error.message || '下载失败，请重试。');
     } finally {
       activeTask = null;
-      ui.download.disabled = false;
-      ui.launch.textContent = '↓ 下载 1080P';
       ui.cancel.hidden = true;
       ui.progress.hidden = !ui.progress.hasAttribute('value');
+      renderInspection();
       syncRoute();
     }
   }
@@ -387,62 +566,161 @@
     if (ratio === null) ui.progress.removeAttribute('value');
     else ui.progress.value = Math.max(0, Math.min(ratio, 1));
     ui.progress.hidden = !activeTask && ratio !== 1;
+    placePanel();
+  }
+
+  function enableIconDragging(button, onMoved) {
+    const stored = GM_getValue('download-icon-position', null);
+    let position = stored && [stored.x, stored.y].every(value => Number.isFinite(value) && value >= 0 && value <= 1)
+      ? { x: stored.x, y: stored.y } : null;
+    let drag = null;
+    let suppressClick = false;
+    const bounds = () => ({ left: 8, top: 8, right: Math.max(8, innerWidth - 56), bottom: Math.max(8, innerHeight - 56) });
+    const place = (left, top) => {
+      const b = bounds();
+      const x = Math.max(b.left, Math.min(left, b.right));
+      const y = Math.max(b.top, Math.min(top, b.bottom));
+      button.style.left = `${x}px`; button.style.top = `${y}px`;
+      return { x: b.right > b.left ? (x - b.left) / (b.right - b.left) : 0,
+        y: b.bottom > b.top ? (y - b.top) / (b.bottom - b.top) : 0 };
+    };
+    const update = () => {
+      if (drag) return;
+      const b = bounds();
+      place(position ? b.left + position.x * (b.right - b.left) : innerWidth - 72,
+        position ? b.top + position.y * (b.bottom - b.top) : innerHeight - 132);
+      onMoved();
+    };
+    button.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      event.stopPropagation();
+      const box = button.getBoundingClientRect();
+      suppressClick = false;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: box.left, top: box.top, moved: false };
+      button.setPointerCapture(event.pointerId);
+    });
+    button.addEventListener('pointermove', event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+      drag.moved = true; suppressClick = true;
+      event.preventDefault(); event.stopPropagation();
+      place(drag.left + dx, drag.top + dy); onMoved();
+    });
+    const finish = (event, cancelled) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const moved = drag.moved;
+      drag = null;
+      if (moved && !cancelled) {
+        position = place(parseFloat(button.style.left), parseFloat(button.style.top));
+        GM_setValue('download-icon-position', position);
+      }
+      if (button.hasPointerCapture(event.pointerId)) button.releasePointerCapture(event.pointerId);
+      if (moved) { event.preventDefault(); event.stopPropagation(); }
+    };
+    button.addEventListener('pointerup', event => finish(event, false));
+    button.addEventListener('pointercancel', event => finish(event, true));
+    button.addEventListener('lostpointercapture', event => finish(event, true));
+    addEventListener('resize', update);
+    return { update, ignoreClick: event => event.detail !== 0 && suppressClick };
+  }
+
+  function placePanel() {
+    if (!ui || ui.panel.hidden) return;
+    const { panel, launch } = ui;
+    const icon = launch.getBoundingClientRect();
+    const edge = 8, gap = 10;
+    const down = icon.top + icon.height / 2 <= innerHeight / 2;
+    const available = down ? innerHeight - icon.bottom - gap - edge : icon.top - gap - edge;
+    // 面板内容变长时在可用一侧内部滚动，保持图标始终可点击、可拖动。
+    panel.style.maxHeight = `${Math.max(0, available)}px`;
+    const width = panel.offsetWidth, height = panel.offsetHeight;
+    const left = Math.max(edge, Math.min(icon.left + icon.width / 2 - width / 2, innerWidth - width - edge));
+    const below = icon.bottom + gap, above = icon.top - gap - height;
+    const maxTop = Math.max(edge, innerHeight - height - edge);
+    let top = down ? below : above;
+    if (top < edge || top > maxTop) {
+      const other = down ? above : below;
+      if (other >= edge && other <= maxTop) top = other;
+    }
+    panel.style.left = `${left}px`;
+    panel.style.top = `${Math.max(edge, Math.min(top, maxTop))}px`;
+  }
+
+  function setPanelOpen(open) {
+    ui.panel.hidden = !open;
+    ui.launch.setAttribute('aria-expanded', String(open));
+    placePanel();
   }
 
   function mount() {
     const host = document.createElement('div');
     host.id = HOST_ID;
-    // 限定样式作用域，避免站点样式影响进度条和按钮。
     const shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        :host{all:initial;position:fixed;right:24px;bottom:84px;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172b3a;font-size:14px}
-        *{box-sizing:border-box} [hidden]{display:none!important}
-        button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:10px 15px;background:#eef3f7;color:#26465d}
-        button:focus-visible{outline:3px solid #73cfff;outline-offset:3px} button:disabled{cursor:wait;opacity:.65}
-        .primary{background:#008ac5;color:white;font-weight:600}
-        #launch{box-shadow:0 4px 18px #001b3b33;border:1px solid #ffffff88;border-radius:24px;padding:12px 20px;float:right}
-        section{width:350px;max-width:calc(100vw - 32px);margin-bottom:12px;background:#fff;border:1px solid #deebf3;border-radius:16px;box-shadow:0 12px 48px #001b3b26;padding:20px}
-        header{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}strong{font-size:16px}#close{padding:2px 8px;background:transparent;font-size:22px;color:#758796}
-        #title{font-weight:600;line-height:1.6;overflow-wrap:anywhere;max-height:100px;overflow:auto}
-        #details{color:#688093;font-size:12px;line-height:1.6;margin-top:7px;overflow-wrap:anywhere}
-        #status{line-height:1.7;margin:16px 0 8px;overflow-wrap:anywhere;min-height:24px}
-        progress{width:100%;height:7px;accent-color:#008ac5;display:block;margin:12px 0 18px}
-        footer{display:flex;gap:9px;margin-top:14px} footer .primary{flex:1}
-        @media(max-width:500px){:host{right:16px;bottom:24px}}
+        :host{all:initial;position:fixed;left:0;top:0;z-index:2147483646;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172b3a}
+        *{box-sizing:border-box}[hidden]{display:none!important}
+        button{font:inherit;cursor:pointer;border:0;border-radius:9px;padding:8px 12px;background:#eef3f7;color:#26465d}
+        button:focus-visible{outline:3px solid #73cfff;outline-offset:3px}button:disabled{cursor:default;opacity:.55}
+        .primary{background:#008ac5;color:white;font-weight:600}.primary:hover:enabled{background:#0078ab}
+        #launch{position:fixed;width:48px;height:48px;display:grid;place-items:center;box-shadow:0 4px 18px #001b3b33;border:1px solid #ffffff88;border-radius:50%;padding:0;touch-action:none;user-select:none;cursor:grab}
+        #launch:active{cursor:grabbing}#launch svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+        section{position:fixed;left:0;top:0;width:min(440px,calc(100vw - 16px));max-height:calc(100vh - 80px);overflow:auto;background:#fff;border:1px solid #deebf3;border-radius:16px;box-shadow:0 12px 48px #001b3b26;padding:18px}
+        header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}header strong{font-size:16px}#close{padding:2px 8px;background:transparent;font-size:22px;color:#758796}
+        #title{font-weight:600;line-height:1.6;overflow-wrap:anywhere;max-height:76px;overflow:auto}
+        #details,.hint,small{color:#688093;font-size:12px;line-height:1.6}#details{margin-top:5px}small{display:block}p{margin:10px 0}
+        table{width:100%;border-collapse:collapse;table-layout:fixed;margin:12px 0}th,td{text-align:left;border-bottom:1px solid #e6eef4;padding:10px 4px;font-size:13px;overflow-wrap:anywhere}th{color:#688093;font-weight:500}th:first-child{width:46%}th:nth-child(2){width:29%}td:last-child{text-align:right}td button{white-space:nowrap;font-size:12px;padding:7px 10px}
+        #task{border-top:1px solid #e6eef4;margin-top:14px;padding-top:12px}#taskTitle{font-size:12px;color:#688093;overflow-wrap:anywhere;max-height:60px;overflow:auto}#status{line-height:1.7;margin:10px 0;overflow-wrap:anywhere}
+        progress{width:100%;height:7px;accent-color:#008ac5;display:block;margin:12px 0}footer{display:flex;gap:8px;margin-top:10px}
       </style>
       <section id="panel" hidden aria-label="哔哩哔哩视频下载">
-        <header><strong>下载当前视频</strong><button id="close" aria-label="收起下载面板">×</button></header>
-        <div id="title">当前分 P</div><div id="details">普通 1080P · 含声音</div>
-        <div id="status" role="status" aria-live="polite">使用当前网页登录状态下载。</div>
-        <progress id="progress" max="1" hidden></progress>
-        <footer><button id="download" class="primary">下载 1080P</button><button id="cancel" hidden>取消</button></footer>
+        <header><strong>下载当前视频</strong><button id="close" type="button" aria-label="收起下载面板">×</button></header>
+        <div id="title">选择当前视频的画质</div><div id="details">使用当前网页登录状态</div>
+        <p id="inspectStatus" role="status" class="hint"></p>
+        <table id="table" hidden><thead><tr><th scope="col">画质</th><th scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
+        <p class="hint">大小为音视频合计，合并后可能略有差异。单次上限 512 MB。</p>
+        <button id="refresh" type="button">刷新列表</button>
+        <div id="task" hidden><div id="taskTitle"></div><div id="status" role="status" aria-live="polite"></div>
+          <progress id="progress" max="1" hidden></progress><footer><button id="cancel" type="button" hidden>取消下载</button></footer>
+        </div>
       </section>
-      <button id="launch" class="primary" title="下载当前分 P 的 1080P 视频">↓ 下载 1080P</button>`;
+      <button id="launch" type="button" class="primary" title="点击选择下载画质，拖动调整位置" aria-label="展开或收起视频下载面板" aria-expanded="false" aria-controls="panel">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/></svg>
+      </button>`;
     document.documentElement.append(host);
     const elements = { host };
-    for (const id of ['panel', 'title', 'details', 'status', 'progress', 'download', 'cancel', 'launch', 'close']) {
-      elements[id] = shadow.getElementById(id);
-    }
-    elements.launch.addEventListener('click', startDownload);
-    elements.download.addEventListener('click', startDownload);
+    for (const id of ['panel', 'title', 'details', 'inspectStatus', 'table', 'rows', 'refresh', 'task', 'taskTitle',
+      'status', 'progress', 'cancel', 'launch', 'close']) elements[id] = shadow.getElementById(id);
+    elements.refresh.addEventListener('click', beginInspection);
     elements.cancel.addEventListener('click', () => activeTask?.abort(abortError()));
-    elements.close.addEventListener('click', () => { elements.panel.hidden = true; });
+    elements.close.addEventListener('click', () => setPanelOpen(false));
     return elements;
   }
 
   function syncRoute() {
     const route = currentVideo();
     ui.host.style.display = route || activeTask ? 'block' : 'none';
-    if (activeTask || route?.key === routeKey) return;
-    routeKey = route?.key || '';
-    ui.panel.hidden = true;
-    ui.title.textContent = route ? `当前分 P：P${route.page}` : '当前分 P';
-    ui.details.textContent = '普通 1080P · 含声音';
-    status('使用当前网页登录状态下载。');
+    const key = route?.key || '';
+    if (key === routeKey) return;
+    routeKey = key;
+    inspection?.controller.abort();
+    inspection = null;
+    setPanelOpen(false);
+    renderInspection();
   }
 
   const ui = mount();
+  const dragging = enableIconDragging(ui.launch, placePanel);
+  ui.launch.addEventListener('click', event => {
+    event.preventDefault(); event.stopPropagation();
+    if (dragging.ignoreClick(event)) return;
+    syncRoute();
+    setPanelOpen(ui.panel.hidden);
+    if (!ui.panel.hidden && !inspection && currentVideo()) void beginInspection();
+  });
+  new ResizeObserver(placePanel).observe(ui.panel);
+  dragging.update();
   syncRoute();
-  setInterval(syncRoute, 1000);
+  setInterval(syncRoute, 500);
 })();
