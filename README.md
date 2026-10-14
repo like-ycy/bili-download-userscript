@@ -1,6 +1,6 @@
 # 哔哩哔哩视频画质选择与下载
 
-[![Version](https://img.shields.io/badge/version-0.2.0-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.1-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 在 B 站普通视频页面点击下载图标，查看当前分 P 可用的 **1080P、720P、480P、360P 等画质和大小**，选择后保存为带声音的 MP4。使用浏览器已有登录状态，只展示普通账号实际可用的画质。
 
@@ -8,13 +8,15 @@
 
 适用于桌面 **Chrome + Tampermonkey（油猴）**。无需安装 FFmpeg、Python 或运行本地服务。
 
+**不建议使用本脚本下载时长较长的视频。** 浏览器需要暂存音视频及合并后的文件，长视频容易占用较多内存。如需下载长视频，推荐使用更专业、功能更丰富的客户端软件 [Bili23-Downloader](https://github.com/ScottSloan/Bili23-Downloader)。
+
 源码仓库：[like-ycy/bili-download-userscript](https://github.com/like-ycy/bili-download-userscript)。问题反馈请提交 [Issue](https://github.com/like-ycy/bili-download-userscript/issues)。
 
 ## 效果示例
 
-![B 站视频页面右下方的 1080P 下载按钮及下载完成面板，红框标出脚本界面](assets/download-example.png)
+![可拖动的圆形下载图标及画质选择面板，展示 1080P、720P、480P、360P 的分辨率、大小和下载按钮](assets/download-example.png)
 
-上图保留了 0.1.0 的下载完成示例，红框用于标注脚本界面。**0.2.0 改为圆形下载图标和画质列表，点击图标只展开列表，选择某一画质后才下载。**
+点击圆形下载图标展开画质列表，每一行展示实际分辨率、编码、含音频的大小和下载按钮。选择画质后开始下载；再次点击图标收起面板，拖动图标时面板跟随移动。截图中的红框用于标注脚本界面。
 
 ## 安装
 

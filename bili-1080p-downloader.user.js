@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.2.0
+// @version      0.2.1
 // @description  拖动下载图标，展开当前分 P 的可用画质和大小，选择后无损下载带声音的 MP4。
+// @author       like-ycy
 // @license      MIT
+// @homepageURL  https://github.com/like-ycy/bili-download-userscript
+// @supportURL   https://github.com/like-ycy/bili-download-userscript/issues
+// @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/*
 // @run-at       document-idle
 // @noframes
