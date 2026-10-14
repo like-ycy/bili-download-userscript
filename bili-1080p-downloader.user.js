@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.3.0
+// @version      0.3.1
 // @description  拖动下载图标，选择视频画质下载带声音的 MP4，或下载动态中的原图与图集 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -875,13 +875,13 @@
         <header><strong id="heading">下载当前视频</strong><button id="close" type="button" aria-label="收起下载面板">×</button></header>
         <div id="title">选择当前视频的画质</div><div id="details">使用当前网页登录状态</div>
         <p id="inspectStatus" role="status" class="hint"></p>
-        <table id="table" hidden><thead><tr><th id="column" scope="col">画质</th><th id="sizeColumn" scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
         <p id="hint" class="hint">大小为音视频合计，合并后可能略有差异。单次上限 512 MB。</p>
         <button id="downloadAll" class="primary" type="button" hidden>下载全部原图（ZIP）</button>
         <button id="refresh" type="button">刷新列表</button>
         <div id="task" hidden><div id="taskTitle"></div><div id="status" role="status" aria-live="polite"></div>
           <progress id="progress" max="1" hidden></progress><footer><button id="cancel" type="button" hidden>取消下载</button></footer>
         </div>
+        <table id="table" hidden><thead><tr><th id="column" scope="col">画质</th><th id="sizeColumn" scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
       </section>
       <button id="launch" type="button" class="primary" title="点击选择下载画质，拖动调整位置" aria-label="展开或收起视频下载面板" aria-expanded="false" aria-controls="panel">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/></svg>

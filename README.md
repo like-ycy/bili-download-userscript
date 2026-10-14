@@ -1,6 +1,6 @@
 # 哔哩哔哩视频与图集下载
 
-[![Version](https://img.shields.io/badge/version-0.3.0-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.3.1-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 在 B 站普通视频页面点击下载图标，查看当前分 P 可用的 **1080P、720P、480P、360P 等画质和大小**，选择后保存为带声音的 MP4。使用浏览器已有登录状态，只展示普通账号实际可用的画质。
 
@@ -51,6 +51,8 @@
 2. 点击下载图标，面板按发布顺序列出原图尺寸、原始格式和估计大小。「查看原图」可打开或复制原图链接。
 3. 点击某张图片旁的「下载」，保存其原始文件；点击「下载全部原图（ZIP）」，保存包含全部图片的 ZIP。
 4. 图片和 ZIP 文件名包含作者、动态文字、动态 ID；图片还带有顺序编号。ZIP 在后台 Worker 中打包，不重新编码或压缩图片，保留原始文件字节及格式；取消会立即终止后台打包。
+
+「下载全部原图」「刷新列表」和下载进度均位于图片列表上方，无需滚动到底部操作。
 
 图集单次下载合计上限为 512 MiB，支持取消和失败后重试。任一图片失败时不会输出缺图的 ZIP。下载开始后切换页面，任务仍属于点击时的图集；刷新或关闭页面会终止任务。完成状态表示文件已交给浏览器，最终保存情况以 Chrome 下载列表为准。
 
