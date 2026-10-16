@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.3.1
+// @version      0.3.2
 // @description  拖动下载图标，选择视频画质下载带声音的 MP4，或下载动态中的原图与图集 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -71,7 +71,7 @@
   function qualityName(qn) { return QUALITY_NAMES[qn] || `画质${Number(qn)}`; }
 
   function filename(info) {
-    const suffix = ` - ${info.bvid} - P${info.page} - ${qualityName(info.qn)}.mp4`;
+    const suffix = ` - P${info.page} - ${qualityName(info.qn)}.mp4`;
     return safeFilename(info.title, suffix, '哔哩哔哩视频');
   }
 
@@ -147,7 +147,8 @@
       throw new Error('无法识别当前分 P，请等视频加载后重试。');
     }
     const title = view.pages.length > 1 ? `${view.title} - ${part.part}` : view.title;
-    return { bvid: view.bvid, cid: part.cid, page: route.page, title, duration: part.duration };
+    const author = view.owner?.name || '哔哩哔哩视频';
+    return { bvid: view.bvid, cid: part.cid, page: route.page, title: `${author} - ${title}`, duration: part.duration };
   }
 
   async function albumInfo(route, signal) {

@@ -1,6 +1,6 @@
 # 哔哩哔哩视频与图集下载
 
-[![Version](https://img.shields.io/badge/version-0.3.1-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.3.2-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 在 B 站普通视频页面点击下载图标，查看当前分 P 可用的 **1080P、720P、480P、360P 等画质和大小**，选择后保存为带声音的 MP4。使用浏览器已有登录状态，只展示普通账号实际可用的画质。
 
@@ -45,7 +45,7 @@
 
 下载中可以点击「取消下载」，也可以收起面板，再点击图标打开。页面切换视频后旧的画质探测会取消，下一次展开读取新视频；已经开始的下载仍属于点击时的视频和画质。刷新或关闭页面会终止任务。
 
-文件名示例：`视频标题 - BV1rhad63EQB - P1 - 1080P.mp4`。
+文件名示例：`用户名 - 视频标题 - P1 - 1080P.mp4`，以视频作者的用户名开头，不再附加 BV 号。
 
 「已交给浏览器保存」表示 MP4 已生成并触发保存；最终保存状态及目录以 Chrome 下载列表为准。
 
@@ -54,7 +54,7 @@
 1. 打开图集动态详情页（`https://www.bilibili.com/opus/动态ID` 或 `https://t.bilibili.com/动态ID`）。
 2. 点击下载图标，面板按发布顺序列出原图尺寸、原始格式和估计大小。「查看原图」可打开或复制原图链接。
 3. 点击某张图片旁的「下载」，保存其原始文件；点击「下载全部原图（ZIP）」，保存包含全部图片的 ZIP。
-4. 图片和 ZIP 文件名包含作者、动态文字、动态 ID；图片还带有顺序编号。ZIP 在后台 Worker 中打包，不重新编码或压缩图片，保留原始文件字节及格式；取消会立即终止后台打包。
+4. 图片、ZIP 及压缩包内的图片文件名均以作者用户名开头，随后是动态标题或文字、动态 ID；图片还带有顺序编号。例如 `用户名 - 动态标题 - 动态ID - 01.jpg`、`用户名 - 动态标题 - 动态ID.zip`。ZIP 在后台 Worker 中打包，不重新编码或压缩图片，保留原始文件字节及格式；取消会立即终止后台打包。
 
 「下载全部原图」「刷新列表」和下载进度均位于图片列表上方，无需滚动到底部操作。
 
