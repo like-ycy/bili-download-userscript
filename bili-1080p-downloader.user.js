@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.3.2
+// @version      0.3.3
 // @description  拖动下载图标，选择视频画质下载带声音的 MP4，或下载动态中的原图与图集 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -42,6 +42,7 @@
   let activeTask = null;
   let inspection = null;
   let routeKey = '';
+  let savedFile = null;
 
   function currentRoute() {
     const url = new URL(location.href);
@@ -99,23 +100,38 @@
   async function api(path, params, signal) {
     checkAbort(signal);
     const query = typeof params === 'string' ? params : new URLSearchParams(params).toString();
-    let response;
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(20000)]);
+    let json;
     try {
-      response = await fetch(`https://api.bilibili.com${path}${query ? `?${query}` : ''}`, {
+      const response = await fetch(`https://api.bilibili.com${path}${query ? `?${query}` : ''}`, {
         credentials: 'include',
-        signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]),
+        signal: requestSignal,
       });
+      if (!response.ok) {
+        const hint = [412, 429].includes(response.status) ? '请求暂时受限，请稍后再试，避免连续刷新。' : '请稍后重试。';
+        throw new Error(`B 站接口请求失败（HTTP ${response.status}），${hint}`);
+      }
+      json = await response.json();
     } catch (error) {
       checkAbort(signal);
-      throw new Error(error.name === 'TimeoutError' ? 'B 站接口请求超时，请重试。' : '无法访问 B 站接口，请检查网络后重试。');
+      if (requestSignal.aborted) throw new Error('B 站接口请求超时，请重试。');
+      if (error.name === 'SyntaxError') throw new Error('B 站接口返回了无法读取的内容，请稍后重试。');
+      if (error.name === 'TypeError') throw new Error('无法访问 B 站接口，请检查网络后重试。');
+      throw error;
     }
-    if (!response.ok) throw new Error(`B 站接口请求失败（HTTP ${response.status}）。`);
-    const json = await response.json();
+    checkAbort(signal);
+    if (!json || typeof json !== 'object' || !Number.isInteger(json.code)) {
+      throw new Error('B 站接口返回的数据格式异常，请稍后重试。');
+    }
     if (json.code !== 0) {
-      const error = new Error(`B 站接口：${String(json.message || '请求失败')}（${json.code}）`);
+      const hint = json.code === -101 ? '请先在当前浏览器登录哔哩哔哩，再刷新列表。'
+        : [-352, -412].includes(json.code) ? '请求暂时受限，请稍后再试，避免连续刷新。'
+        : json.code === -403 ? '请刷新列表重试；若反复出现，请检查电脑日期和时间是否正确。' : '';
+      const error = new Error(`B 站接口：${String(json.message || '请求失败')}（${json.code}）${hint}`);
       error.apiCode = json.code;
       throw error;
     }
+    if (!json.data || typeof json.data !== 'object') throw new Error('B 站接口未返回有效数据，请稍后重试。');
     return json.data;
   }
 
@@ -278,9 +294,12 @@
       if (!url) throw new Error('媒体地址不属于允许的 B 站域名或路径。');
       let request;
       let settled = false;
+      let timeout;
+      const probing = range || method === 'HEAD';
       const finish = (error, value) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timeout);
         signal.removeEventListener('abort', cancel);
         if (error) reject(error); else resolve(value);
       };
@@ -297,17 +316,29 @@
           finish(new Error('媒体服务器返回了错误页面。'));
         } else finish(null, response);
       };
+      const receiveResponse = response => {
+        if (settled) return;
+        receive(response);
+        if (range) {
+          // 匿名请求使用 Fetch；通过 stream 的 onloadstart 读取头部，不依赖 readyState=2。
+          if (typeof response.response?.cancel === 'function') void response.response.cancel().catch(() => {});
+          request?.abort();
+        }
+      };
       signal.addEventListener('abort', cancel, { once: true });
       try {
+        // Chrome 下匿名请求的内置 timeout 不生效，进度事件也不能作为完成请求的前提。
+        timeout = setTimeout(() => {
+          finish(new Error(probing ? '媒体大小读取超时，请重试。'
+            : '媒体下载超过 15 分钟，请检查网络后重试；大文件建议使用桌面下载器。'));
+          request?.abort();
+        }, probing ? 10000 : 15 * 60 * 1000);
         request = GM_xmlhttpRequest({
-          method, url, responseType: 'blob', anonymous: true, timeout: range || method === 'HEAD' ? 10000 : 180000,
+          method, url, responseType: range ? 'stream' : 'blob', anonymous: true, timeout: 0,
           headers: { Referer: 'https://www.bilibili.com/', ...(range ? { Range: 'bytes=0-0' } : {}) },
-          onreadystatechange(response) {
-            // Range 探测取得响应头即停止正文，CDN 忽略 Range 也不读取整个视频。
-            if (range && !settled && response.readyState === 2 && response.status) {
-              receive(response);
-              request?.abort();
-            }
+          onloadstart(response) {
+            // CDN 忽略 Range 时同样停止流，不收集完整文件。
+            if (range) receiveResponse(response);
           },
           onprogress(event) {
             if (settled) return;
@@ -316,10 +347,7 @@
               request?.abort();
             } else onProgress?.(event.loaded || 0, event.lengthComputable ? event.total : 0);
           },
-          onload(response) {
-            if (settled) return;
-            receive(response);
-          },
+          onload: receiveResponse,
           onerror: () => finish(new Error('媒体下载失败，请检查网络或油猴的域名访问权限。')),
           ontimeout: () => finish(new Error('媒体下载超时，请重试。')),
           onabort: () => finish(signal.reason || abortError()),
@@ -429,11 +457,18 @@
     };
   }
 
-  function mux(info, video, audio, signal) {
+  function workerLibrary(resource, label) {
+    let library;
+    try { library = GM_getResourceText(resource); } catch { /* 统一提示资源缺失或读取失败。 */ }
+    if (typeof library !== 'string' || !library.trim()) {
+      throw new Error(`${label}组件未加载，请确认可以访问 jsDelivr，并在油猴中重新安装脚本后刷新页面。`);
+    }
+    return library;
+  }
+
+  function mux(info, video, audio, signal, library) {
     return new Promise((resolve, reject) => {
       checkAbort(signal);
-      const library = GM_getResourceText('BiliMux');
-      if (!library) throw new Error('合并组件未加载，请在油猴中重新安装脚本后重试。');
       const url = URL.createObjectURL(new Blob([library, '\n;(', muxWorkerMain.toString(), ')();'], { type: 'text/javascript' }));
       let worker;
       let settled = false;
@@ -453,6 +488,7 @@
         worker = new Worker(url);
         worker.onerror = () => finish(new Error('无法启动音视频合并组件，请检查油猴资源加载情况后重试。'));
         worker.onmessage = ({ data }) => {
+          if (settled) return;
           if (data.type === 'progress') status('正在合并音视频…', data.ratio);
           if (data.type === 'error') finish(new Error(data.message));
           if (data.type === 'done') finish(null, data);
@@ -463,16 +499,25 @@
     });
   }
 
+  function clearSavedFile() {
+    if (!savedFile) return;
+    clearTimeout(savedFile.timeout);
+    URL.revokeObjectURL(savedFile.url);
+    savedFile = null;
+    ui.saveAgain.hidden = true;
+    ui.saveAgain.removeAttribute('href');
+    ui.saveAgain.removeAttribute('download');
+  }
+
   function save(buffer, name) {
+    clearSavedFile();
     const blob = buffer instanceof Blob ? buffer : new Blob([buffer], { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = name;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    savedFile = { url, timeout: setTimeout(clearSavedFile, 60000) };
+    ui.saveAgain.href = url;
+    ui.saveAgain.download = name;
+    ui.saveAgain.hidden = false;
+    ui.saveAgain.click();
   }
 
   async function beginInspection() {
@@ -541,13 +586,15 @@
     ui.sizeColumn.textContent = album ? '原图大小（约）' : '大小（含音频）';
     ui.hint.textContent = album ? '按发布顺序下载原图，保留原始格式。打包为一个 ZIP，单次上限 512 MB。'
       : '大小为音视频合计，合并后可能略有差异。单次上限 512 MB。';
+    const albumOversized = album && state?.rows.reduce((sum, row) => sum + (row.size || 0), 0) > MAX_BYTES;
     ui.downloadAll.hidden = !album;
     ui.downloadAll.disabled = Boolean(activeTask || state?.busy || !state?.rows.length
-      || state.rows.reduce((sum, row) => sum + (row.size || 0), 0) > MAX_BYTES);
+      || albumOversized);
     if (album) {
       ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前图集…' : '下载动态中的原图');
       ui.details.textContent = state?.info ? `动态 ${state.info.id} · ${state.rows.length} 张原图` : '使用当前网页可访问的动态';
       ui.inspectStatus.textContent = state?.error || (state?.busy ? '正在获取图集原图…'
+        : albumOversized ? `共 ${state.rows.length} 张图片，预计合计超过 512 MB，请分张下载。`
         : state?.rows.length ? `共 ${state.rows.length} 张图片，可单张下载或全部打包。` : '点击刷新列表，读取当前图集。');
     } else {
       ui.title.textContent = state?.info?.title || (state?.busy ? '正在读取当前视频…' : '选择当前视频的画质');
@@ -593,6 +640,7 @@
   async function startDownload(state, row) {
     if (activeTask || state !== inspection || row.probing || row.size > MAX_BYTES) return;
     if (currentRoute()?.key !== state.key) { syncRoute(); return; }
+    clearSavedFile();
     const controller = new AbortController();
     // 固定点击时的视频、分 P 和画质；页面切换不会改写正在进行的任务。
     const info = { ...state.info, qn: row.qn, codec: row.codec };
@@ -604,6 +652,7 @@
     renderInspection();
     const started = performance.now();
     try {
+      const library = workerLibrary('BiliMux', '音视频合并');
       const play = await playInfo(info, row.qn, controller.signal);
       const selected = qualityRows(play).find(candidate => candidate.qn === row.qn && candidate.codec.id === row.codec.id);
       if (!selected) throw new Error('所选画质已不可用，请刷新画质列表后重试。');
@@ -630,7 +679,7 @@
       ]);
       checkAbort(controller.signal);
       status('正在合并音视频…', 0);
-      const result = await mux(info, video, audio, controller.signal);
+      const result = await mux(info, video, audio, controller.signal, library);
       checkAbort(controller.signal);
       const name = filename(info);
       save(result.buffer, name);
@@ -653,6 +702,7 @@
   async function startAlbumDownload(state, selectedRow = null) {
     if (activeTask || state !== inspection || state?.kind !== 'album' || state.busy || !state.rows.length) return;
     if (currentRoute()?.key !== state.key) { syncRoute(); return; }
+    clearSavedFile();
     const rows = selectedRow ? [selectedRow] : [...state.rows];
     const info = { ...state.info };
     const controller = new AbortController();
@@ -664,6 +714,7 @@
     renderInspection();
     let completedBytes = 0;
     try {
+      const library = selectedRow ? null : workerLibrary('BiliZip', '图集打包');
       const files = [];
       for (const [index, row] of rows.entries()) {
         checkAbort(signal);
@@ -685,7 +736,7 @@
       }
       if (!selectedRow) {
         status('正在打包图集…', 0.9);
-        const result = await packAlbum(files, signal);
+        const result = await packAlbum(files, signal, library);
         checkAbort(signal);
         save(new Blob([result.buffer], { type: 'application/zip' }), albumFilename(info));
         console.info('[Bili1080P] 已生成图集 ZIP', { id: info.id, images: rows.length,
@@ -724,11 +775,9 @@
     };
   }
 
-  function packAlbum(files, signal) {
+  function packAlbum(files, signal, library) {
     return new Promise((resolve, reject) => {
       checkAbort(signal);
-      const library = GM_getResourceText('BiliZip');
-      if (!library) throw new Error('图集打包组件未加载，请重新安装脚本后重试。');
       const url = URL.createObjectURL(new Blob([library, '\n;(', zipWorkerMain.toString(), ')();'], { type: 'text/javascript' }));
       let worker;
       let settled = false;
@@ -880,7 +929,8 @@
         <button id="downloadAll" class="primary" type="button" hidden>下载全部原图（ZIP）</button>
         <button id="refresh" type="button">刷新列表</button>
         <div id="task" hidden><div id="taskTitle"></div><div id="status" role="status" aria-live="polite"></div>
-          <progress id="progress" max="1" hidden></progress><footer><button id="cancel" type="button" hidden>取消下载</button></footer>
+          <progress id="progress" max="1" hidden></progress><footer><button id="cancel" type="button" hidden>取消下载</button>
+            <a id="saveAgain" hidden title="浏览器未开始保存时可再次点击，无需重新下载。开始新任务后此链接失效。">重新保存文件（60 秒内）</a></footer>
         </div>
         <table id="table" hidden><thead><tr><th id="column" scope="col">画质</th><th id="sizeColumn" scope="col">大小（含音频）</th><th scope="col">操作</th></tr></thead><tbody id="rows"></tbody></table>
       </section>
@@ -890,7 +940,7 @@
     document.documentElement.append(host);
     const elements = { host };
     for (const id of ['panel', 'title', 'details', 'inspectStatus', 'table', 'rows', 'refresh', 'task', 'taskTitle',
-      'status', 'progress', 'cancel', 'launch', 'close', 'heading', 'column', 'sizeColumn', 'hint', 'downloadAll']) elements[id] = shadow.getElementById(id);
+      'status', 'progress', 'cancel', 'saveAgain', 'launch', 'close', 'heading', 'column', 'sizeColumn', 'hint', 'downloadAll']) elements[id] = shadow.getElementById(id);
     elements.refresh.addEventListener('click', beginInspection);
     elements.downloadAll.addEventListener('click', () => startAlbumDownload(inspection));
     elements.cancel.addEventListener('click', () => activeTask?.abort(abortError()));
@@ -922,5 +972,10 @@
   new ResizeObserver(placePanel).observe(ui.panel);
   dragging.update();
   syncRoute();
+  addEventListener('beforeunload', event => {
+    if (!activeTask || activeTask.signal.aborted) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
   setInterval(syncRoute, 500);
 })();
