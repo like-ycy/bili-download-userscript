@@ -17,10 +17,12 @@
 ## 效果示例
 
 ![可拖动的圆形下载图标及画质选择面板，展示 1080P、720P、480P、360P 的分辨率、大小和下载按钮](assets/download-example.png)
+![可拖动的圆形下载图标及画质选择面板，展示 1080P、720P、480P、360P 的分辨率、大小和下载按钮(外链图片)](https://greasyfork.org/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsiZGF0YSI6MzE3NzE3LCJwdXIiOiJibG9iX2lkIn19--153387a7197c8bf434441eb108e76d88898a304e/ScreenShot_2026-10-14_152607_796%20(1).png?locale=zh-CN)
 
 点击圆形下载图标展开画质列表，每一行展示实际分辨率、编码、含音频的大小和下载按钮。选择画质后开始下载；再次点击图标收起面板，拖动图标时面板跟随移动。截图中的红框用于标注脚本界面。
 
 ![图集详情页的下载面板，列出每张原图的尺寸、格式、大小和下载按钮，并展示 ZIP 打包下载](assets/download-example2.png)
+![图集详情页的下载面板，列出每张原图的尺寸、格式、大小和下载按钮，并展示 ZIP 打包下载(外链图片)](https://greasyfork.org/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsiZGF0YSI6MzE3NzMzLCJwdXIiOiJibG9iX2lkIn19--89a46f04cc0ffb821e98c498f3162529c2035c3e/ScreenShot_2026-10-14_165518_544%20(1).png?locale=zh-CN)
 
 在图集动态详情页展开面板，按发布顺序列出全部原图，每张显示实际尺寸、原始格式和约计大小，可逐张下载或一键打包为 ZIP；打包完成状态和合计大小直接显示在图片列表上方。
 
