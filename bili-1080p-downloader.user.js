@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩 1080P 下载
 // @namespace    bili-1080p-downloader
-// @version      0.3.3
+// @version      0.3.4
 // @description  拖动下载图标，选择视频画质下载带声音的 MP4，或下载动态中的原图与图集 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -320,26 +320,28 @@
         if (settled) return;
         receive(response);
         if (range) {
-          // 匿名请求使用 Fetch；通过 stream 的 onloadstart 读取头部，不依赖 readyState=2。
+          // 响应头可从不同回调到达；一旦拿到就停止流，不收集完整文件。
           if (typeof response.response?.cancel === 'function') void response.response.cancel().catch(() => {});
           request?.abort();
         }
       };
+      const receiveRangeHeaders = response => {
+        // 油猴 5.5.1 的 onloadstart 只有流对象，HTTP 状态和响应头要等后续回调。
+        if (range && response.status) receiveResponse(response);
+      };
       signal.addEventListener('abort', cancel, { once: true });
       try {
-        // Chrome 下匿名请求的内置 timeout 不生效，进度事件也不能作为完成请求的前提。
+        // 自行控制总时限；不传 timeout: 0，油猴 5.5.1 会将其当作立即超时。
         timeout = setTimeout(() => {
           finish(new Error(probing ? '媒体大小读取超时，请重试。'
             : '媒体下载超过 15 分钟，请检查网络后重试；大文件建议使用桌面下载器。'));
           request?.abort();
         }, probing ? 10000 : 15 * 60 * 1000);
         request = GM_xmlhttpRequest({
-          method, url, responseType: range ? 'stream' : 'blob', anonymous: true, timeout: 0,
+          method, url, responseType: range ? 'stream' : 'blob', anonymous: true,
           headers: { Referer: 'https://www.bilibili.com/', ...(range ? { Range: 'bytes=0-0' } : {}) },
-          onloadstart(response) {
-            // CDN 忽略 Range 时同样停止流，不收集完整文件。
-            if (range) receiveResponse(response);
-          },
+          onloadstart: receiveRangeHeaders,
+          onreadystatechange: receiveRangeHeaders,
           onprogress(event) {
             if (settled) return;
             if (range && event.loaded > 65536) {

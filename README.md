@@ -1,6 +1,6 @@
 # 哔哩哔哩视频与图集下载
 
-[![Version](https://img.shields.io/badge/version-0.3.3-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.3.4-00AEEC)](bili-1080p-downloader.user.js) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 在 B 站普通视频页面点击下载图标，查看当前分 P 可用的 **1080P、720P、480P、360P 等画质和大小**，选择后保存为带声音的 MP4。使用浏览器已有登录状态，只展示普通账号实际可用的画质。
 
@@ -103,6 +103,8 @@
 
 媒体下载失败时先检查网络和油猴的域名访问权限，再重试以获取新的播放地址。合并组件加载失败时，确认可以访问 jsDelivr，然后重新安装脚本并刷新页面。
 
+如果使用 **0.3.3** 时能列出画质，但大小全部未知、点击下载很快提示「媒体下载超时」，请更新到 **0.3.4 或更高版本**，保存后刷新视频页面。0.3.3 的请求参数会在 Tampermonkey 5.5.1 中触发立即超时。
+
 脚本会在开始下载前检查合并或 ZIP 组件是否存在，组件缺失时会提前提示；单张原图下载不需要 ZIP 组件。这项检查不能保证组件一定能启动，浏览器限制或资源损坏仍可能在合并、打包阶段报错。
 
 如果之前拒绝了域名访问，需在 Tampermonkey 中重新允许对应域名，具体位置随版本而异；只刷新页面不一定会再次弹出授权询问。视频需要 `bilivideo.com` / `bilivideo.cn`，原图需要 `hdslb.com`，包括它们的子域名。
@@ -168,10 +170,19 @@ bili-download-userscript/
 
 图集验证应覆盖：原图数量与顺序、原图地址不含缩略图参数、单张文件、ZIP 全部条目的字节一致性、取消及失败后重试、页面切换、非图集动态、非法图片地址与 512 MiB 上限。
 
-请求适配需遵守 [Tampermonkey 的 GM_xmlhttpRequest 契约](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest&locale=en)：`anonymous: true` 强制使用 Fetch，Chrome 中内置 `timeout` 不生效，`readystatechange` 只有 DONE。脚本因此自行计时，Range 探测通过 `responseType: 'stream'` 的 `onloadstart` 取得响应头后取消流；验证时不能假定一定有实时进度或 `readyState=2` 回调。
+请求适配参考 [Tampermonkey 的 GM_xmlhttpRequest 文档](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest&locale=en)，同时以实际版本验证为准。Chrome + Tampermonkey 5.5.1 的匿名请求中，显式的 `timeout: 0` 会触发立即超时；流请求的 `onloadstart` 先给出 `status=0`，之后才在 `readystatechange` 提供有效响应头。脚本省略 `timeout` 并自行计时；Range 探测使用流响应，只在回调带有有效 HTTP 状态时处理头部并取消流。兼容头部在启动、状态变化或完成回调中到达的情况，不能只凭模拟接口推断油猴行为。
+
+### 0.3.4 验证
+
+- 2026-10-26，在用户当前 Chrome + Tampermonkey 5.5.1 页面复现 0.3.3 回归：同一媒体 HEAD 请求传 `timeout: 0` 约 1 秒进入超时回调，省略该参数或传入 10000 均返回 HTTP 200 和正确大小。
+- 修复后，`BV1qZg863ECF` 的 1080P / 720P / 480P / 360P 分别显示约 16.3 / 11.3 / 8.5 / 7.2 MB。真实 Range 探测返回 HTTP 206，正确取得文件总大小；请求取消返回 `AbortError`。
+- 当前视频的 1080P 完成下载、合并和浏览器保存，成品为 1920×1080、H.264 + AAC，时长约 366.14 秒，文件 17,168,469 字节，完整解码无错误。
+- 480P 在媒体下载过程中取消后重试成功，成品为 852×480、H.264 + AAC，时长约 366.14 秒，文件 9,014,137 字节，浏览器确认保存完成，完整解码无错误。
+- 8 组定点回归检查通过，覆盖零值超时参数、HTTP 0 的启动回调、不同头部回调顺序、独立超时、取消及迟到回调、完整正文等待、HEAD 失败后 Range 回退和错误响应流清理。临时验证脚本不随项目发布。
 
 ### 0.3.3 验证
 
+- 以下为当时的验证记录，未覆盖实际油猴中 `timeout: 0` 和流启动回调的行为，因此未发现上述回归；这些问题在 0.3.4 修复。
 - 语法与 diff 检查通过；23 组本地检查通过，覆盖请求超时、备用地址切换、取消清理、接口正文超时与异常、资源缺失、重新保存与到期、页面切换、大小上限，以及图集单张和 ZIP 任务。
 - 请求检查包含遵循上述 Fetch 契约的适配器及本地 HTTP 服务，不发送进度事件、不触发内置超时：用模拟时钟验证 4 分钟后仍可完成、15 分钟超时后断开并切换备用地址、10 秒探测超时及重试；还验证服务器忽略 Range 时取消流、用户取消时关闭连接。
 - 在独立临时配置的 Chrome 156 中，用本地模拟页面验证：自动保存被阻止后，手动点击「重新保存文件」能保存相同字节；进行中的任务触发离开提醒，选择留在页面后继续保留页面；任务结束后刷新不再提醒。
